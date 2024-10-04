@@ -450,7 +450,7 @@ static void check_for_prio_changes(void)
 		      task->pid, last->cpu);
 
 		if (requeue_preempted_job(last->tracked))
-			requeue2(last->linked);
+			requeue2(last->tracked);
 
 		track_task_to_cpu(task, last);
 	}
