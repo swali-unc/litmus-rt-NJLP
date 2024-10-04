@@ -168,7 +168,7 @@ static void update_cpu_position(cpu_entry_t *entry)
 
 static void update_cpu_position2(cpu_entry_t *entry)
 {
-	if (likely(bheap_node_in_heap(entry->hn)))
+	if (likely(bheap_node_in_heap(entry->hn2)))
 		bheap_delete(cpu_lower_base_prio, &gsnedf_cpu_heap2, entry->hn2);
 	bheap_insert(cpu_lower_base_prio, &gsnedf_cpu_heap2, entry->hn2);
 }
@@ -335,11 +335,12 @@ static noinline void requeue(struct task_struct* task)
 static noinline void requeue2(struct task_struct* task)
 {
 	BUG_ON(!task);
-	/* sanity check before insertion */
-	BUG_ON(is_queued2(task));
 
-	if (is_early_releasing(task) || is_released(task, litmus_clock()))
+	if (is_early_releasing(task) || is_released(task, litmus_clock())) {
+		/* sanity check before insertion */
+		BUG_ON(is_queued2(task));
 		__add_pending(&gsnedf, task);
+	}
 	// requeue should take care of adding things to the release Q for us
 }
 

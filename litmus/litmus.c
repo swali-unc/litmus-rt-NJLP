@@ -374,6 +374,7 @@ static long __litmus_admit_task(struct task_struct* tsk)
 		return -ENOMEM;
 	} else {
 		bheap_node_init(&tsk_rt(tsk)->heap_node, tsk);
+		bheap_node_init(&tsk_rt(tsk)->heap_node2, tsk);
 	}
 
 	preempt_disable();
