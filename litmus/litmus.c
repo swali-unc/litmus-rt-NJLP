@@ -365,9 +365,10 @@ static long __litmus_admit_task(struct task_struct* tsk)
 
 	/* allocate heap node for this task */
 	tsk_rt(tsk)->heap_node = bheap_node_alloc(GFP_ATOMIC);
+	tsk_rt(tsk)->heap_node2 = bheap_node_alloc(GFP_ATOMIC);
 	tsk_rt(tsk)->rel_heap = release_heap_alloc(GFP_ATOMIC);
 
-	if (!tsk_rt(tsk)->heap_node || !tsk_rt(tsk)->rel_heap) {
+	if (!tsk_rt(tsk)->heap_node || !tsk_rt(tsk)->heap_node2 || !tsk_rt(tsk)->rel_heap) {
 		printk(KERN_WARNING "litmus: no more heap node memory!?\n");
 
 		return -ENOMEM;
@@ -417,6 +418,8 @@ out:
 	if (retval) {
 		if (tsk_rt(tsk)->heap_node)
 			bheap_node_free(tsk_rt(tsk)->heap_node);
+		if (tsk_rt(tsk)->heap_node2)
+			bheap_node_free(tsk_rt(tsk)->heap_node2);
 		if (tsk_rt(tsk)->rel_heap)
 			release_heap_free(tsk_rt(tsk)->rel_heap);
 	}
@@ -426,7 +429,9 @@ out:
 void litmus_clear_state(struct task_struct* tsk)
 {
     BUG_ON(bheap_node_in_heap(tsk_rt(tsk)->heap_node));
+    BUG_ON(bheap_node_in_heap(tsk_rt(tsk)->heap_node2));
     bheap_node_free(tsk_rt(tsk)->heap_node);
+    bheap_node_free(tsk_rt(tsk)->heap_node2);
     release_heap_free(tsk_rt(tsk)->rel_heap);
 
     atomic_dec(&rt_task_count);

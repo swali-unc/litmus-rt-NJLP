@@ -20,6 +20,7 @@ obj-y     = sched_plugin.o litmus.o \
 	    ctrldev.o \
 	    uncachedev.o \
 	    sched_gsn_edf.o \
+		sched_gsn_edf2.o \
 	    sched_psn_edf.o \
 	    sched_pfp.o
 

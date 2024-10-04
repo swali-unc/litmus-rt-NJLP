@@ -250,6 +250,8 @@ struct rt_param {
 	 */
 	volatile int		linked_on;
 
+	volatile int		tracked_on;
+
 	/* PFAIR/PD^2 state. Allocated on demand. */
 	union {
 		void *plugin_state;
@@ -275,6 +277,7 @@ struct rt_param {
 	 *          implementation).
 	 */
 	struct bheap_node*	heap_node;
+	struct bheap_node*  heap_node2;
 	struct release_heap*	rel_heap;
 
 	/* Used by rt_domain to queue task in release list.

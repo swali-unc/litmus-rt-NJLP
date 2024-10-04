@@ -74,6 +74,9 @@ static enum hrtimer_restart on_release_timer(struct hrtimer *timer)
 
 	/* call release callback */
 	rh->dom->release_jobs(rh->dom, &rh->heap);
+	if (rh->dom->release_jobs2) {
+		rh->dom->release_jobs2(rh->dom, &rh->heap2);
+	}
 	/* WARNING: rh can be referenced from other CPUs from now on. */
 
 	TS_RELEASE_END;
@@ -170,6 +173,7 @@ static void reinit_release_heap(struct task_struct* t)
 
 	/* initialize */
 	bheap_init(&rh->heap);
+	bheap_init(&rh->heap2);
 }
 /* arm_release_timer() - start local release timer or trigger
  *     remote timer (pull timer)
@@ -221,6 +225,8 @@ static void arm_release_timer(rt_domain_t *_rt)
 			rh = get_release_heap(rt, t, 1);
 		}
 		bheap_insert(rt->order, &rh->heap, tsk_rt(t)->heap_node);
+		if (rt->order2)
+			bheap_insert(rt->order2, &rh->heap2, tsk_rt(t)->heap_node2);
 		VTRACE_TASK(t, "arm_release_timer(): added to release heap\n");
 
 		raw_spin_unlock(&rt->release_lock);
@@ -264,10 +270,12 @@ static void arm_release_timer(rt_domain_t *_rt)
 	}
 }
 
-void rt_domain_init(rt_domain_t *rt,
+void rt_domain_init2(rt_domain_t *rt,
 		    bheap_prio_t order,
+			bheap_prio_t order2,
 		    check_resched_needed_t check,
-		    release_jobs_t release
+		    release_jobs_t release,
+			release_jobs_t release2
 		   )
 {
 	int i;
@@ -279,12 +287,15 @@ void rt_domain_init(rt_domain_t *rt,
 		release = default_release_jobs;
 	if (!order)
 		order = dummy_order;
+	if (!order2)
+		order2 = dummy_order;
 
 #ifdef CONFIG_RELEASE_MASTER
 	rt->release_master = NO_CPU;
 #endif
 
 	bheap_init(&rt->ready_queue);
+	bheap_init(&rt->pending_queue);
 	INIT_LIST_HEAD(&rt->tobe_released);
 	for (i = 0; i < RELEASE_QUEUE_SLOTS; i++)
 		INIT_LIST_HEAD(&rt->release_queue.slot[i]);
@@ -295,7 +306,18 @@ void rt_domain_init(rt_domain_t *rt,
 
 	rt->check_resched 	= check;
 	rt->release_jobs	= release;
+	rt->release_jobs2	= release2;
 	rt->order		= order;
+	rt->order2		= order2;
+}
+
+void rt_domain_init(rt_domain_t *rt,
+		    bheap_prio_t order,
+		    check_resched_needed_t check,
+		    release_jobs_t release
+		   )
+{
+	rt_domain_init2(rt, order, NULL, check, release, NULL);
 }
 
 /* add_ready - add a real-time task to the rt ready queue. It must be runnable.
@@ -315,6 +337,20 @@ void __add_ready(rt_domain_t* rt, struct task_struct *new)
 	rt->check_resched(rt);
 }
 
+void __add_pending(rt_domain_t* rt, struct task_struct *new)
+{
+	TRACE("rt: adding %s/%d (%llu, %llu, %llu) rel=%llu "
+		"to pending queue at %llu\n",
+		new->comm, new->pid,
+		get_exec_cost(new), get_rt_period(new), get_rt_relative_deadline(new),
+		get_release(new), litmus_clock());
+
+	BUG_ON(bheap_node_in_heap(tsk_rt(new)->heap_node2));
+
+	bheap_insert(rt->order2, &rt->pending_queue, tsk_rt(new)->heap_node2);
+	rt->check_resched(rt);
+}
+
 /* merge_ready - Add a sorted set of tasks to the rt ready queue. They must be runnable.
  * @tasks      - the newly released tasks
  */
@@ -324,6 +360,11 @@ void __merge_ready(rt_domain_t* rt, struct bheap* tasks)
 	rt->check_resched(rt);
 }
 
+void __merge_pending(rt_domain_t* rt, struct bheap* tasks)
+{
+	bheap_union(rt->order2, &rt->pending_queue, tasks);
+	rt->check_resched(rt);
+}
 
 #ifdef CONFIG_RELEASE_MASTER
 void __add_release_on(rt_domain_t* rt, struct task_struct *task,

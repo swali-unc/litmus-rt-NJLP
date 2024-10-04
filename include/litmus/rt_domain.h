@@ -24,6 +24,7 @@ typedef struct _rt_domain {
 	/* runnable rt tasks are in here */
 	raw_spinlock_t 			ready_lock;
 	struct bheap	 		ready_queue;
+	struct bheap			pending_queue;
 
 	/* real-time tasks waiting for release are in here */
 	raw_spinlock_t 			release_lock;
@@ -42,9 +43,11 @@ typedef struct _rt_domain {
 
 	/* how do we release jobs? */
 	release_jobs_t			release_jobs;
+	release_jobs_t			release_jobs2;
 
 	/* how are tasks ordered in the ready queue? */
 	bheap_prio_t			order;
+	bheap_prio_t			order2;
 } rt_domain_t;
 
 struct release_heap {
@@ -53,6 +56,7 @@ struct release_heap {
 	lt_t				release_time;
 	/* all tasks to be released at release_time */
 	struct bheap			heap;
+	struct bheap			heap2;
 	/* used to trigger the release */
 	struct hrtimer			timer;
 
@@ -74,17 +78,42 @@ static inline struct task_struct* __next_ready(rt_domain_t* rt)
 		return NULL;
 }
 
+static inline struct task_struct* __next_pending(rt_domain_t* rt)
+{
+	struct bheap_node *hn = bheap_peek(rt->order2, &rt->pending_queue);
+	if (hn)
+		return bheap2task(hn);
+	else
+		return NULL;
+}
+
+void rt_domain_init2(rt_domain_t *rt, bheap_prio_t order, bheap_prio_t order2,
+		    check_resched_needed_t check,
+		    release_jobs_t release,
+			release_jobs_t release2);
+
 void rt_domain_init(rt_domain_t *rt, bheap_prio_t order,
 		    check_resched_needed_t check,
-		    release_jobs_t relase);
+		    release_jobs_t release);
 
 void __add_ready(rt_domain_t* rt, struct task_struct *new);
+void __add_pending(rt_domain_t* rt, struct task_struct *new);
 void __merge_ready(rt_domain_t* rt, struct bheap *tasks);
+void __merge_pending(rt_domain_t* rt, struct bheap *tasks);
 void __add_release(rt_domain_t* rt, struct task_struct *task);
 
 static inline struct task_struct* __take_ready(rt_domain_t* rt)
 {
 	struct bheap_node* hn = bheap_take(rt->order, &rt->ready_queue);
+	if (hn)
+		return bheap2task(hn);
+	else
+		return NULL;
+}
+
+static inline struct task_struct* __take_pending(rt_domain_t* rt)
+{
+	struct bheap_node* hn = bheap_take(rt->order2, &rt->pending_queue);
 	if (hn)
 		return bheap2task(hn);
 	else
@@ -100,15 +129,35 @@ static inline struct task_struct* __peek_ready(rt_domain_t* rt)
 		return NULL;
 }
 
+static inline struct task_struct* __peek_pending(rt_domain_t* rt)
+{
+	struct bheap_node* hn = bheap_peek(rt->order2, &rt->pending_queue);
+	if (hn)
+		return bheap2task(hn);
+	else
+		return NULL;
+}
+
 static inline int  is_queued(struct task_struct *t)
 {
 	BUG_ON(!tsk_rt(t)->heap_node);
 	return bheap_node_in_heap(tsk_rt(t)->heap_node);
 }
 
+static inline int  is_queued2(struct task_struct *t)
+{
+	BUG_ON(!tsk_rt(t)->heap_node2);
+	return bheap_node_in_heap(tsk_rt(t)->heap_node2);
+}
+
 static inline void remove(rt_domain_t* rt, struct task_struct *t)
 {
 	bheap_delete(rt->order, &rt->ready_queue, tsk_rt(t)->heap_node);
+}
+
+static inline void remove2(rt_domain_t* rt, struct task_struct *t)
+{
+	bheap_delete(rt->order2, &rt->pending_queue, tsk_rt(t)->heap_node2);
 }
 
 static inline void add_ready(rt_domain_t* rt, struct task_struct *new)
@@ -166,6 +215,11 @@ static inline void add_release_on(rt_domain_t* rt,
 static inline int __jobs_pending(rt_domain_t* rt)
 {
 	return !bheap_empty(&rt->ready_queue);
+}
+
+static inline int __jobs_pending2(rt_domain_t* rt)
+{
+	return !bheap_empty(&rt->pending_queue);
 }
 
 static inline int jobs_pending(rt_domain_t* rt)

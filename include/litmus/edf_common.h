@@ -15,11 +15,21 @@
 void edf_domain_init(rt_domain_t* rt, check_resched_needed_t resched,
 		     release_jobs_t release);
 
+void edf_domain_init2(rt_domain_t* rt, check_resched_needed_t resched,
+		     release_jobs_t release, release_jobs_t release2);
+
 int edf_higher_prio(struct task_struct* first,
+		    struct task_struct* second);
+
+int edf_higher_base_prio(struct task_struct* first,
 		    struct task_struct* second);
 
 int edf_ready_order(struct bheap_node* a, struct bheap_node* b);
 
+int edf_pending_order(struct bheap_node* a, struct bheap_node* b);
+
 int edf_preemption_needed(rt_domain_t* rt, struct task_struct *t);
+
+int edf_preemption_needed2(rt_domain_t* rt, struct task_struct *t);
 
 #endif
