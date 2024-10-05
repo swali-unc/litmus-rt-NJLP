@@ -211,7 +211,7 @@ static int njlp_priority_order(struct bheap_node* a, struct bheap_node* b)
 	return (tsk_rt(ta)->pi_blocked > tsk_rt(tb)->pi_blocked);
 }
 
-static void try_update_pi_blocking(struct task_struct* t)
+static void try_update_pi_blocking(struct task_struct* t, int update_last)
 {
 	lt_t now;
 
@@ -223,7 +223,10 @@ static void try_update_pi_blocking(struct task_struct* t)
 	/* Update pi-blocking */
 	now = litmus_clock();
 	tsk_rt(t)->pi_blocked += now - tsk_rt(t)->last_updated;
-	tsk_rt(t)->last_updated = 0;
+	if (update_last)
+		tsk_rt(t)->last_updated = now;
+	else
+		tsk_rt(t)->last_updated = 0;
 
 	/* Re-order waitq heap due to pi-blocking change */
 	bheap_delete(njlp_priority_order, &tsk_rt(t)->sem->waitq, 
@@ -298,6 +301,7 @@ static noinline void track_task_to_cpu(struct task_struct* tracked,
 	/* Currently tracked task is set to be untracked. */
 	if (entry->tracked) {
 		entry->tracked->rt_param.tracked_on = NO_CPU;
+		try_update_pi_blocking(entry->tracked, 0);
 	}
 
 	/* Link new task to CPU. */
@@ -354,7 +358,7 @@ static noinline void untrack(struct task_struct* t)
 		t->rt_param.tracked_on = NO_CPU;
 		track_task_to_cpu(NULL, entry);
 
-		try_update_pi_blocking(t);
+		try_update_pi_blocking(t, 0);
 	} else if (is_queued2(t)) {
 		remove2(&gsnedf, t);
 	}
@@ -989,13 +993,12 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 
 	spin_lock_irqsave(&sem->wait.lock, flags);
 
-	tsk_rt(t)->pi_blocked = 0;
-	tsk_rt(t)->last_updated = litmus_clock();
-
 	if (sem->owner) {
 		/* resource is not free => must suspend and wait */
 
 		init_waitqueue_entry(&wait, t);
+		tsk_rt(t)->pi_blocked = 0;
+		tsk_rt(t)->last_updated = litmus_clock();
 		tsk_rt(t)->sem = sem;
 		tsk_rt(t)->waitq_entry = &wait;
 
@@ -1065,15 +1068,15 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 		/* loop through top m prio pending jobs and update pi-blocking*/
 		for_each_online_cpu(cpu) {
 			entry = &per_cpu(gsnedf2_cpu_entries, cpu);
-			try_update_pi_blocking(entry->tracked);
+			try_update_pi_blocking(entry->tracked, 1);
 		}
 	}
 
 	/* check if there are jobs waiting for this resource */
 	next = take_waitqueue(sem);
-	BUG_ON(tsk_rt(next)->sem != sem);
 
 	if (next) {
+		BUG_ON(tsk_rt(next)->sem != sem);
 		tsk_rt(next)->sem = NULL;
 		tsk_rt(next)->waitq_entry = NULL;
 		tsk_rt(next)->pi_blocked = 0;
