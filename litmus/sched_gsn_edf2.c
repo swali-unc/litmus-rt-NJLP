@@ -105,6 +105,21 @@
  */
 
 
+/* struct for semaphore with priority inheritance */
+struct njlp_semaphore {
+	struct litmus_lock litmus_lock;
+
+	/* current resource holder */
+	struct task_struct *owner;
+
+	/* highest-priority waiter */
+	struct task_struct *hp_waiter;
+
+	/* priority queue of waiting tasks */
+	struct bheap waitq;
+	wait_queue_head_t wait;
+};
+
 /* cpu_entry_t - maintain the linked and scheduled state
  */
 typedef struct  {
@@ -188,6 +203,35 @@ static cpu_entry_t* lowest_base_prio_cpu(void)
 	return hn->value;
 }
 
+static int njlp_priority_order(struct bheap_node* a, struct bheap_node* b)
+{
+	struct task_struct* ta = bheap2task(a);
+	struct task_struct* tb = bheap2task(b);
+
+	return (tsk_rt(ta)->pi_blocked > tsk_rt(tb)->pi_blocked);
+}
+
+static void try_update_pi_blocking(struct task_struct* t)
+{
+	lt_t now;
+
+	if (!t || !is_waitqueued(t))
+		return;
+
+	BUG_ON(!tsk_rt(t)->last_updated);
+
+	/* Update pi-blocking */
+	now = litmus_clock();
+	tsk_rt(t)->pi_blocked += now - tsk_rt(t)->last_updated;
+	tsk_rt(t)->last_updated = 0;
+
+	/* Re-order waitq heap due to pi-blocking change */
+	bheap_delete(njlp_priority_order, &tsk_rt(t)->sem->waitq, 
+			tsk_rt(t)->waitq_heap_node);
+	bheap_insert(njlp_priority_order, &tsk_rt(t)->sem->waitq,
+			tsk_rt(t)->waitq_heap_node);
+}
+
 /* link_task_to_cpu - Update the link of a CPU.
  *                    Handles the case where the to-be-linked task is already
  *                    scheduled on a different CPU.
@@ -247,6 +291,8 @@ static noinline void link_task_to_cpu(struct task_struct* linked,
 static noinline void track_task_to_cpu(struct task_struct* tracked,
 				      cpu_entry_t *entry)
 {
+	lt_t now = litmus_clock();
+
 	BUG_ON(tracked && !is_realtime(tracked));
 
 	/* Currently tracked task is set to be untracked. */
@@ -257,6 +303,11 @@ static noinline void track_task_to_cpu(struct task_struct* tracked,
 	/* Link new task to CPU. */
 	if (tracked) {
 		tracked->rt_param.tracked_on = entry->cpu;
+
+		/* try to update pi-blocking */
+		if (is_waitqueued(tracked)) {
+			tsk_rt(tracked)->last_updated = now;
+		}
 	}
 	entry->tracked = tracked;
 
@@ -302,6 +353,8 @@ static noinline void untrack(struct task_struct* t)
 		entry = &per_cpu(gsnedf2_cpu_entries, t->rt_param.tracked_on);
 		t->rt_param.tracked_on = NO_CPU;
 		track_task_to_cpu(NULL, entry);
+
+		try_update_pi_blocking(t);
 	} else if (is_queued2(t)) {
 		remove2(&gsnedf, t);
 	}
@@ -874,27 +927,35 @@ static void clear_priority_inheritance(struct task_struct* t)
 
 /* ******************** FMLP support ********************** */
 
-/* struct for semaphore with priority inheritance */
-struct fmlp_semaphore {
-	struct litmus_lock litmus_lock;
-
-	/* current resource holder */
-	struct task_struct *owner;
-
-	/* highest-priority waiter */
-	struct task_struct *hp_waiter;
-
-	/* FIFO queue of waiting tasks */
-	wait_queue_head_t wait;
-};
-
-static inline struct fmlp_semaphore* fmlp_from_lock(struct litmus_lock* lock)
+static inline struct njlp_semaphore* njlp_from_lock(struct litmus_lock* lock)
 {
-	return container_of(lock, struct fmlp_semaphore, litmus_lock);
+	return container_of(lock, struct njlp_semaphore, litmus_lock);
+}
+
+static inline void add_waitqueue(struct njlp_semaphore *sem, struct task_struct* new)
+{
+	BUG_ON(bheap_node_in_heap(tsk_rt(new)->waitq_heap_node));
+
+	bheap_insert(njlp_priority_order, &sem->waitq, tsk_rt(new)->waitq_heap_node);
+	__add_wait_queue_entry_tail_exclusive(&sem->wait, tsk_rt(new)->waitq_entry);
+}
+
+static inline struct task_struct* take_waitqueue(struct njlp_semaphore *sem)
+{
+	struct task_struct* t;
+
+	struct bheap_node* hn = bheap_take(njlp_priority_order, &sem->waitq);
+	if (hn) {
+		t = bheap2task(hn);
+		__remove_wait_queue(&sem->wait, tsk_rt(t)->waitq_entry);
+		return t;
+	}
+	else
+		return NULL;
 }
 
 /* caller is responsible for locking */
-struct task_struct* find_hp_waiter2(struct fmlp_semaphore *sem,
+struct task_struct* find_hp_waiter2(struct njlp_semaphore *sem,
 				   struct task_struct* skip)
 {
 	struct list_head	*pos;
@@ -912,10 +973,10 @@ struct task_struct* find_hp_waiter2(struct fmlp_semaphore *sem,
 	return found;
 }
 
-int gsnedf2_fmlp_lock(struct litmus_lock* l)
+int gsnedf_njlp_lock(struct litmus_lock* l)
 {
 	struct task_struct* t = current;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
+	struct njlp_semaphore *sem = njlp_from_lock(l);
 	wait_queue_entry_t wait;
 	unsigned long flags;
 
@@ -928,15 +989,20 @@ int gsnedf2_fmlp_lock(struct litmus_lock* l)
 
 	spin_lock_irqsave(&sem->wait.lock, flags);
 
+	tsk_rt(t)->pi_blocked = 0;
+	tsk_rt(t)->last_updated = litmus_clock();
+
 	if (sem->owner) {
 		/* resource is not free => must suspend and wait */
 
 		init_waitqueue_entry(&wait, t);
+		tsk_rt(t)->sem = sem;
+		tsk_rt(t)->waitq_entry = &wait;
 
 		/* FIXME: interruptible would be nice some day */
 		set_current_state(TASK_UNINTERRUPTIBLE);
 
-		__add_wait_queue_entry_tail_exclusive(&sem->wait, &wait);
+		add_waitqueue(sem, t);
 
 		/* check if we need to activate priority inheritance */
 		if (edf_higher_prio(t, sem->hp_waiter)) {
@@ -975,12 +1041,15 @@ int gsnedf2_fmlp_lock(struct litmus_lock* l)
 	return 0;
 }
 
-int gsnedf2_fmlp_unlock(struct litmus_lock* l)
+int gsnedf_njlp_unlock(struct litmus_lock* l)
 {
 	struct task_struct *t = current, *next;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
+	struct njlp_semaphore *sem = njlp_from_lock(l);
 	unsigned long flags;
 	int err = 0;
+
+	int cpu;
+	cpu_entry_t *entry;
 
 	spin_lock_irqsave(&sem->wait.lock, flags);
 
@@ -991,9 +1060,25 @@ int gsnedf2_fmlp_unlock(struct litmus_lock* l)
 
 	tsk_rt(t)->num_locks_held--;
 
+	/* only do pi-blocking updates if there are suspended jobs */
+	if (bheap_peek(njlp_priority_order, &sem->waitq)) {
+		/* loop through top m prio pending jobs and update pi-blocking*/
+		for_each_online_cpu(cpu) {
+			entry = &per_cpu(gsnedf2_cpu_entries, cpu);
+			try_update_pi_blocking(entry->tracked);
+		}
+	}
+
 	/* check if there are jobs waiting for this resource */
-	next = __waitqueue_remove_first(&sem->wait);
+	next = take_waitqueue(sem);
+	BUG_ON(tsk_rt(next)->sem != sem);
+
 	if (next) {
+		tsk_rt(next)->sem = NULL;
+		tsk_rt(next)->waitq_entry = NULL;
+		tsk_rt(next)->pi_blocked = 0;
+		BUG_ON(is_waitqueued(next));
+
 		/* next becomes the resouce holder */
 		sem->owner = next;
 		TRACE_CUR("lock ownership passed to %s/%d\n", next->comm, next->pid);
@@ -1033,10 +1118,10 @@ out:
 	return err;
 }
 
-int gsnedf2_fmlp_close(struct litmus_lock* l)
+int gsnedf_njlp_close(struct litmus_lock* l)
 {
 	struct task_struct *t = current;
-	struct fmlp_semaphore *sem = fmlp_from_lock(l);
+	struct njlp_semaphore *sem = njlp_from_lock(l);
 	unsigned long flags;
 
 	int owner;
@@ -1048,26 +1133,26 @@ int gsnedf2_fmlp_close(struct litmus_lock* l)
 	spin_unlock_irqrestore(&sem->wait.lock, flags);
 
 	if (owner)
-		gsnedf2_fmlp_unlock(l);
+		gsnedf_njlp_unlock(l);
 
 	return 0;
 }
 
-void gsnedf2_fmlp_free(struct litmus_lock* lock)
+void gsnedf_njlp_free(struct litmus_lock* lock)
 {
-	kfree(fmlp_from_lock(lock));
+	kfree(njlp_from_lock(lock));
 }
 
-static struct litmus_lock_ops gsnedf_fmlp_lock_ops = {
-	.close  = gsnedf2_fmlp_close,
-	.lock   = gsnedf2_fmlp_lock,
-	.unlock = gsnedf2_fmlp_unlock,
-	.deallocate = gsnedf2_fmlp_free,
+static struct litmus_lock_ops gsnedf_njlp_lock_ops = {
+	.close  = gsnedf_njlp_close,
+	.lock   = gsnedf_njlp_lock,
+	.unlock = gsnedf_njlp_unlock,
+	.deallocate = gsnedf_njlp_free,
 };
 
-static struct litmus_lock* gsnedf_new_fmlp(void)
+static struct litmus_lock* gsnedf_new_njlp(void)
 {
-	struct fmlp_semaphore* sem;
+	struct njlp_semaphore* sem;
 
 	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
 	if (!sem)
@@ -1075,8 +1160,9 @@ static struct litmus_lock* gsnedf_new_fmlp(void)
 
 	sem->owner   = NULL;
 	sem->hp_waiter = NULL;
+	bheap_init(&sem->waitq);
 	init_waitqueue_head(&sem->wait);
-	sem->litmus_lock.ops = &gsnedf_fmlp_lock_ops;
+	sem->litmus_lock.ops = &gsnedf_njlp_lock_ops;
 
 	return &sem->litmus_lock;
 }
@@ -1092,9 +1178,9 @@ static long gsnedf_allocate_lock(struct litmus_lock **lock, int type,
 	/* GSN-EDF currently only supports the FMLP for global resources. */
 	switch (type) {
 
-	case FMLP_SEM:
-		/* Flexible Multiprocessor Locking Protocol */
-		*lock = gsnedf_new_fmlp();
+	case NJLP_SEM:
+		/* non-JLFP Locking Protocol */
+		*lock = gsnedf_new_njlp();
 		if (*lock)
 			err = 0;
 		else

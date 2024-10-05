@@ -280,6 +280,12 @@ struct rt_param {
 	struct bheap_node*  heap_node2;
 	struct release_heap*	rel_heap;
 
+	struct njlp_semaphore* sem;
+	struct bheap_node*  waitq_heap_node;
+	wait_queue_entry_t* waitq_entry;
+	lt_t pi_blocked;
+	lt_t last_updated;
+
 	/* Used by rt_domain to queue task in release list.
 	 */
 	struct list_head list;

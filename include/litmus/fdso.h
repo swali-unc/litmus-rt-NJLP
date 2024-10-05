@@ -27,7 +27,9 @@ typedef enum  {
 
 	DFLP_SEM	= 6,
 
-	MAX_OBJ_TYPE	= 6
+	NJLP_SEM	= 7,
+
+	MAX_OBJ_TYPE	= 7
 } obj_type_t;
 
 struct inode_obj_id {

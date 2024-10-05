@@ -150,6 +150,12 @@ static inline int  is_queued2(struct task_struct *t)
 	return bheap_node_in_heap(tsk_rt(t)->heap_node2);
 }
 
+static inline int  is_waitqueued(struct task_struct *t)
+{
+	BUG_ON(!tsk_rt(t)->waitq_heap_node);
+	return bheap_node_in_heap(tsk_rt(t)->waitq_heap_node);
+}
+
 static inline void remove(rt_domain_t* rt, struct task_struct *t)
 {
 	bheap_delete(rt->order, &rt->ready_queue, tsk_rt(t)->heap_node);
