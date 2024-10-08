@@ -141,6 +141,8 @@ struct rt_job {
 	/* How much service has this job received so far? */
 	lt_t	exec_time;
 
+	unsigned int zero_laxity:1;
+
 	/* By how much did the prior job miss its deadline by?
 	 * Value differs from tardiness in that lateness may
 	 * be negative (when job finishes before its deadline).
@@ -280,11 +282,13 @@ struct rt_param {
 	struct bheap_node*  heap_node2;
 	struct release_heap*	rel_heap;
 
-	struct njlp_semaphore* sem;
+	struct litmus_lock* sem;
 	struct bheap_node*  waitq_heap_node;
-	wait_queue_entry_t* waitq_entry;
+	struct bheap_node*  waitq_heap_node2;
 	lt_t pi_blocked;
 	lt_t last_updated;
+
+	struct hrtimer zl_timer;
 
 	/* Used by rt_domain to queue task in release list.
 	 */

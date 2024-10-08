@@ -14,12 +14,14 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/topology.h>
 #include <linux/slab.h>
+#include <linux/hrtimer.h>
 
 #include <litmus/debug_trace.h>
 #include <litmus/litmus.h>
+#include <litmus/budget.h>
 #include <litmus/jobs.h>
 #include <litmus/sched_plugin.h>
-#include <litmus/edf_common.h>
+#include <litmus/edzl_common.h>
 #include <litmus/sched_trace.h>
 #include <litmus/trace.h>
 
@@ -117,8 +119,14 @@ struct njlp_semaphore {
 
 	/* priority queue of waiting tasks */
 	struct bheap waitq;
-	wait_queue_head_t wait;
+	struct bheap waitq2;
+	spinlock_t waitlock;
 };
+
+static inline struct njlp_semaphore* njlp_from_lock(struct litmus_lock* lock)
+{
+	return container_of(lock, struct njlp_semaphore, litmus_lock);
+}
 
 /* cpu_entry_t - maintain the linked and scheduled state
  */
@@ -157,7 +165,7 @@ static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
 	/* Note that a and b are inverted: we want the lowest-priority CPU at
 	 * the top of the heap.
 	 */
-	return edf_higher_prio(b->linked, a->linked);
+	return edzl_higher_prio(b->linked, a->linked);
 }
 
 static int cpu_lower_base_prio(struct bheap_node *_a, struct bheap_node *_b)
@@ -168,7 +176,7 @@ static int cpu_lower_base_prio(struct bheap_node *_a, struct bheap_node *_b)
 	/* Note that a and b are inverted: we want the lowest-priority CPU at
 	 * the top of the heap.
 	 */
-	return edf_higher_base_prio(b->linked, a->linked);
+	return edzl_higher_base_prio(b->linked, a->linked);
 }
 
 /* update_cpu_position - Move the cpu entry to the correct place to maintain
@@ -214,6 +222,7 @@ static int njlp_priority_order(struct bheap_node* a, struct bheap_node* b)
 static void try_update_pi_blocking(struct task_struct* t, int update_last)
 {
 	lt_t now;
+	struct njlp_semaphore* sem;
 
 	if (!t || !is_waitqueued(t))
 		return;
@@ -228,10 +237,12 @@ static void try_update_pi_blocking(struct task_struct* t, int update_last)
 	else
 		tsk_rt(t)->last_updated = 0;
 
+	sem = njlp_from_lock(tsk_rt(t)->sem);
+
 	/* Re-order waitq heap due to pi-blocking change */
-	bheap_delete(njlp_priority_order, &tsk_rt(t)->sem->waitq, 
+	bheap_delete(njlp_priority_order, &sem->waitq, 
 			tsk_rt(t)->waitq_heap_node);
-	bheap_insert(njlp_priority_order, &tsk_rt(t)->sem->waitq,
+	bheap_insert(njlp_priority_order, &sem->waitq,
 			tsk_rt(t)->waitq_heap_node);
 }
 
@@ -364,6 +375,129 @@ static noinline void untrack(struct task_struct* t)
 	}
 }
 
+static void update_queue_position(struct task_struct *t);
+static void update_queue_position2(struct task_struct *t);
+
+static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
+{
+	unsigned long flags;
+	struct task_struct* t;
+
+	raw_spin_lock_irqsave(&gsnedf_lock, flags);
+
+	t = container_of(container_of(timer, struct rt_param, zl_timer),
+			struct task_struct,
+			rt_param);
+
+	set_zerolaxity(t);
+	update_queue_position(t);
+	update_queue_position2(t);
+
+	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
+
+	return HRTIMER_NORESTART;
+}
+
+static inline struct task_struct* __edzl_take_ready(rt_domain_t* rt)
+{
+	struct task_struct* t = __take_ready(rt);
+
+	if (t) {
+		if (get_zerolaxity(t) == 0) {
+			if (hrtimer_active(&tsk_rt(t)->zl_timer)) {
+				hrtimer_try_to_cancel(&tsk_rt(t)->zl_timer);
+			}
+		}
+	}
+	return t;
+}
+
+static inline void __edzl_add_ready(rt_domain_t* rt, struct task_struct *new)
+{
+	__add_ready(rt, new);
+
+	if (get_zerolaxity(new) == 0) {
+		lt_t when_to_fire;
+
+		when_to_fire = get_deadline(new) - budget_remaining(new);
+
+		hrtimer_start_range_ns(&tsk_rt(new)->zl_timer,
+				ns_to_ktime(when_to_fire),
+				0,
+				HRTIMER_MODE_ABS_PINNED);
+	}
+}
+
+static void check_for_preemptions(void);
+static struct task_struct* find_hp_waiter(struct njlp_semaphore *sem);
+
+static void update_queue_position(struct task_struct *t)
+{
+	int check_preempt = 0;
+	struct njlp_semaphore* sem;
+	unsigned long flags;
+
+	if (is_waitqueued(t)) {
+		sem = njlp_from_lock(tsk_rt(t)->sem);
+		BUG_ON(!sem);
+
+		spin_lock(&sem->waitlock);
+		bheap_decrease(edzl_ready_order, tsk_rt(t)->waitq_heap_node2);
+
+		sem->hp_waiter = find_hp_waiter(sem);
+		if (sem->hp_waiter == t)
+			tsk_rt(sem->owner)->inh_task = t;
+		spin_unlock(&sem->waitlock);
+	}
+
+	if (tsk_rt(t)->linked_on != NO_CPU) {
+		bheap_delete(cpu_lower_prio, &gsnedf_cpu_heap,
+				gsnedf2_cpus[tsk_rt(t)->linked_on]->hn);
+		bheap_insert(cpu_lower_prio, &gsnedf_cpu_heap,
+				gsnedf2_cpus[tsk_rt(t)->linked_on]->hn);
+	} else {
+		raw_spin_lock(&gsnedf.release_lock);
+		if (is_queued(t)) {
+			check_preempt = !bheap_decrease(edzl_ready_order,
+					tsk_rt(t)->heap_node);
+		}
+		raw_spin_unlock(&gsnedf.release_lock);
+
+		if (check_preempt) {
+			bheap_uncache_min(edzl_ready_order,
+					&gsnedf.ready_queue);
+			check_for_preemptions();
+		}
+	}
+}
+
+static void check_for_prio_changes(void);
+
+static void update_queue_position2(struct task_struct *t)
+{
+	int check_preempt = 0;
+
+	if (tsk_rt(t)->tracked_on != NO_CPU) {
+		bheap_delete(cpu_lower_base_prio, &gsnedf_cpu_heap,
+				gsnedf2_cpus[tsk_rt(t)->tracked_on]->hn);
+		bheap_insert(cpu_lower_base_prio, &gsnedf_cpu_heap,
+				gsnedf2_cpus[tsk_rt(t)->tracked_on]->hn);
+	} else {
+		raw_spin_lock(&gsnedf.release_lock);
+		if (is_queued2(t)) {
+			check_preempt = !bheap_decrease(edzl_pending_order,
+					tsk_rt(t)->heap_node);
+		}
+		raw_spin_unlock(&gsnedf.release_lock);
+
+		if (check_preempt) {
+			bheap_uncache_min(edzl_pending_order,
+					&gsnedf.pending_queue);
+			check_for_prio_changes();
+		}
+	}
+}
+
 /* preempt - force a CPU to reschedule
  */
 static void preempt(cpu_entry_t *entry)
@@ -381,7 +515,7 @@ static noinline void requeue(struct task_struct* task)
 	BUG_ON(is_queued(task));
 
 	if (is_early_releasing(task) || is_released(task, litmus_clock()))
-		__add_ready(&gsnedf, task);
+		__edzl_add_ready(&gsnedf, task);
 	else {
 		/* it has got to wait */
 		untrack(task);
@@ -438,7 +572,7 @@ static void check_for_preemptions(void)
 	    && likely(local->cpu != gsnedf.release_master)
 #endif
 		) {
-		task = __take_ready(&gsnedf);
+		task = __edzl_take_ready(&gsnedf);
 		TRACE_TASK(task, "linking to local CPU %d to avoid IPI\n", local->cpu);
 		link_task_to_cpu(task, local);
 		preempt(local);
@@ -446,10 +580,10 @@ static void check_for_preemptions(void)
 #endif
 
 	for (last = lowest_prio_cpu();
-	     edf_preemption_needed(&gsnedf, last->linked);
+	     edzl_preemption_needed(&gsnedf, last->linked);
 	     last = lowest_prio_cpu()) {
 		/* preemption necessary */
-		task = __take_ready(&gsnedf);
+		task = __edzl_take_ready(&gsnedf);
 		TRACE("check_for_preemptions: attempting to link task %d to %d\n",
 		      task->pid, last->cpu);
 
@@ -499,7 +633,7 @@ static void check_for_prio_changes(void)
 #endif
 
 	for (last = lowest_base_prio_cpu();
-	     edf_preemption_needed2(&gsnedf, last->tracked);
+	     edzl_preemption_needed2(&gsnedf, last->tracked);
 	     last = lowest_base_prio_cpu()) {
 		/* preemption necessary */
 		task = __take_pending(&gsnedf);
@@ -517,6 +651,11 @@ static void check_for_prio_changes(void)
 static noinline void gsnedf_job_arrival(struct task_struct* task)
 {
 	BUG_ON(!task);
+
+	if (laxity_remaining(task))
+		clear_zerolaxity(task);
+	else
+		set_zerolaxity(task);
 
 	requeue(task);
 	check_for_preemptions();
@@ -677,7 +816,7 @@ static struct task_struct* gsnedf_schedule(struct task_struct * prev)
 	/* Link pending task if we became unlinked.
 	 */
 	if (!entry->linked)
-		link_task_to_cpu(__take_ready(&gsnedf), entry);
+		link_task_to_cpu(__edzl_take_ready(&gsnedf), entry);
 	if (!entry->tracked)
 		track_task_to_cpu(__take_pending(&gsnedf), entry);
 
@@ -745,6 +884,9 @@ static void gsnedf_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 	TRACE("gsn edf: task new %d\n", t->pid);
 
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
+
+	hrtimer_init(&t->rt_param.zl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	tsk_rt(t)->zl_timer.function = on_zero_laxity;
 
 	/* setup job params */
 	release_at(t, litmus_clock());
@@ -825,6 +967,10 @@ static void gsnedf_task_exit(struct task_struct * t)
 		gsnedf2_cpus[tsk_rt(t)->tracked_on]->tracked = NULL;
 		tsk_rt(t)->tracked_on = NO_CPU;
 	}
+
+	if (hrtimer_active(&tsk_rt(t)->zl_timer)) {
+		hrtimer_cancel(&tsk_rt(t)->zl_timer);
+	}
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
 
 	BUG_ON(!is_realtime(t));
@@ -876,7 +1022,7 @@ static void set_priority_inheritance(struct task_struct* t, struct task_struct* 
 			 * heap. Note that this could be a release heap if we
 			 * budget enforcement is used and this job overran. */
 			check_preempt =
-				!bheap_decrease(edf_ready_order,
+				!bheap_decrease(edzl_ready_order,
 					       tsk_rt(t)->heap_node);
 		} else {
 			/* Nothing to do: if it is not queued and not linked
@@ -899,7 +1045,7 @@ static void set_priority_inheritance(struct task_struct* t, struct task_struct* 
 			/* heap_decrease() hit the top level of the heap: make
 			 * sure preemption checks get the right task, not the
 			 * potentially stale cache. */
-			bheap_uncache_min(edf_ready_order,
+			bheap_uncache_min(edzl_ready_order,
 					 &gsnedf.ready_queue);
 			check_for_preemptions();
 		}
@@ -931,19 +1077,16 @@ static void clear_priority_inheritance(struct task_struct* t)
 
 /* ******************** FMLP support ********************** */
 
-static inline struct njlp_semaphore* njlp_from_lock(struct litmus_lock* lock)
-{
-	return container_of(lock, struct njlp_semaphore, litmus_lock);
-}
-
+/* caller is responsible for locking */
 static inline void add_waitqueue(struct njlp_semaphore *sem, struct task_struct* new)
 {
 	BUG_ON(bheap_node_in_heap(tsk_rt(new)->waitq_heap_node));
 
 	bheap_insert(njlp_priority_order, &sem->waitq, tsk_rt(new)->waitq_heap_node);
-	__add_wait_queue_entry_tail_exclusive(&sem->wait, tsk_rt(new)->waitq_entry);
+	bheap_insert(edzl_ready_order, &sem->waitq2, tsk_rt(new)->waitq_heap_node2);
 }
 
+/* caller is responsible for locking */
 static inline struct task_struct* take_waitqueue(struct njlp_semaphore *sem)
 {
 	struct task_struct* t;
@@ -951,37 +1094,26 @@ static inline struct task_struct* take_waitqueue(struct njlp_semaphore *sem)
 	struct bheap_node* hn = bheap_take(njlp_priority_order, &sem->waitq);
 	if (hn) {
 		t = bheap2task(hn);
-		__remove_wait_queue(&sem->wait, tsk_rt(t)->waitq_entry);
+		bheap_delete(edzl_ready_order, &sem->waitq2, tsk_rt(t)->waitq_heap_node2);
 		return t;
-	}
-	else
+	} else
 		return NULL;
 }
 
 /* caller is responsible for locking */
-struct task_struct* find_hp_waiter2(struct njlp_semaphore *sem,
-				   struct task_struct* skip)
+static struct task_struct* find_hp_waiter(struct njlp_semaphore *sem)
 {
-	struct list_head	*pos;
-	struct task_struct	*queued, *found = NULL;
-
-	list_for_each(pos, &sem->wait.head) {
-		queued  = (struct task_struct*) list_entry(pos,
-							   wait_queue_entry_t,
-							   entry)->private;
-
-		/* Compare task prios, find high prio task. */
-		if (queued != skip && edf_higher_prio(queued, found))
-			found = queued;
-	}
-	return found;
+	struct bheap_node* hn = bheap_peek(edzl_ready_order, &sem->waitq2);
+	if (hn)
+		return bheap2task(hn);
+	else
+		return NULL;
 }
 
 int gsnedf_njlp_lock(struct litmus_lock* l)
 {
 	struct task_struct* t = current;
 	struct njlp_semaphore *sem = njlp_from_lock(l);
-	wait_queue_entry_t wait;
 	unsigned long flags;
 
 	if (!is_realtime(t))
@@ -991,16 +1123,14 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 	if (tsk_rt(t)->num_locks_held)
 		return -EBUSY;
 
-	spin_lock_irqsave(&sem->wait.lock, flags);
+	spin_lock_irqsave(&sem->waitlock, flags);
 
 	if (sem->owner) {
 		/* resource is not free => must suspend and wait */
 
-		init_waitqueue_entry(&wait, t);
 		tsk_rt(t)->pi_blocked = 0;
 		tsk_rt(t)->last_updated = litmus_clock();
-		tsk_rt(t)->sem = sem;
-		tsk_rt(t)->waitq_entry = &wait;
+		tsk_rt(t)->sem = &sem->litmus_lock;
 
 		/* FIXME: interruptible would be nice some day */
 		set_current_state(TASK_UNINTERRUPTIBLE);
@@ -1008,16 +1138,16 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 		add_waitqueue(sem, t);
 
 		/* check if we need to activate priority inheritance */
-		if (edf_higher_prio(t, sem->hp_waiter)) {
+		if (edzl_higher_prio(t, sem->hp_waiter)) {
 			sem->hp_waiter = t;
-			if (edf_higher_prio(t, sem->owner))
+			if (edzl_higher_prio(t, sem->owner))
 				set_priority_inheritance(sem->owner, sem->hp_waiter);
 		}
 
 		TS_LOCK_SUSPEND;
 
 		/* release lock before sleeping */
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
+		spin_unlock_irqrestore(&sem->waitlock, flags);
 
 		/* We depend on the FIFO order.  Thus, we don't need to recheck
 		 * when we wake up; we are guaranteed to have the lock since
@@ -1036,7 +1166,7 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 		/* it's ours now */
 		sem->owner = t;
 
-		spin_unlock_irqrestore(&sem->wait.lock, flags);
+		spin_unlock_irqrestore(&sem->waitlock, flags);
 	}
 
 	tsk_rt(t)->num_locks_held++;
@@ -1054,7 +1184,7 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 	int cpu;
 	cpu_entry_t *entry;
 
-	spin_lock_irqsave(&sem->wait.lock, flags);
+	spin_lock_irqsave(&sem->waitlock, flags);
 
 	if (sem->owner != t) {
 		err = -EINVAL;
@@ -1076,9 +1206,8 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 	next = take_waitqueue(sem);
 
 	if (next) {
-		BUG_ON(tsk_rt(next)->sem != sem);
+		BUG_ON(tsk_rt(next)->sem != l);
 		tsk_rt(next)->sem = NULL;
-		tsk_rt(next)->waitq_entry = NULL;
 		tsk_rt(next)->pi_blocked = 0;
 		BUG_ON(is_waitqueued(next));
 
@@ -1093,7 +1222,7 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 			 * inherit.  However, we need to make sure that the
 			 * next-highest priority in the queue is reflected in
 			 * hp_waiter. */
-			sem->hp_waiter = find_hp_waiter2(sem, next);
+			sem->hp_waiter = find_hp_waiter(sem);
 			if (sem->hp_waiter)
 				TRACE_TASK(sem->hp_waiter, "is new highest-prio waiter\n");
 			else
@@ -1116,7 +1245,7 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 		clear_priority_inheritance(t);
 
 out:
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
+	spin_unlock_irqrestore(&sem->waitlock, flags);
 
 	return err;
 }
@@ -1129,11 +1258,11 @@ int gsnedf_njlp_close(struct litmus_lock* l)
 
 	int owner;
 
-	spin_lock_irqsave(&sem->wait.lock, flags);
+	spin_lock_irqsave(&sem->waitlock, flags);
 
 	owner = sem->owner == t;
 
-	spin_unlock_irqrestore(&sem->wait.lock, flags);
+	spin_unlock_irqrestore(&sem->waitlock, flags);
 
 	if (owner)
 		gsnedf_njlp_unlock(l);
@@ -1164,7 +1293,8 @@ static struct litmus_lock* gsnedf_new_njlp(void)
 	sem->owner   = NULL;
 	sem->hp_waiter = NULL;
 	bheap_init(&sem->waitq);
-	init_waitqueue_head(&sem->wait);
+	bheap_init(&sem->waitq2);
+	spin_lock_init(&sem->waitlock);
 	sem->litmus_lock.ops = &gsnedf_njlp_lock_ops;
 
 	return &sem->litmus_lock;
@@ -1280,7 +1410,7 @@ static long gsnedf_deactivate_plugin(void)
 
 /*	Plugin object	*/
 static struct sched_plugin gsn_edf_plugin __cacheline_aligned_in_smp = {
-	.plugin_name		= "GSN-EDF-NJLP",
+	.plugin_name		= "EDZL-NJLP",
 	.finish_switch		= gsnedf_finish_switch,
 	.task_new		= gsnedf_task_new,
 	.complete_job		= complete_job,
@@ -1316,7 +1446,7 @@ static int __init init_gsn_edf(void)
 		bheap_node_init(&entry->hn2, entry);
 	}
 	// not having edf_domain_init2 is not a mistake
-	edf_domain_init2(&gsnedf, NULL, gsnedf_release_jobs, gsnedf_release_jobs2);
+	edzl_domain_init2(&gsnedf, NULL, gsnedf_release_jobs, gsnedf_release_jobs2);
 	return register_sched_plugin(&gsn_edf_plugin);
 }
 

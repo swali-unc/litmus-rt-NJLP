@@ -287,8 +287,6 @@ void rt_domain_init2(rt_domain_t *rt,
 		release = default_release_jobs;
 	if (!order)
 		order = dummy_order;
-	if (!order2)
-		order2 = dummy_order;
 
 #ifdef CONFIG_RELEASE_MASTER
 	rt->release_master = NO_CPU;

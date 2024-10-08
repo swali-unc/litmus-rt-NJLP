@@ -19,6 +19,22 @@ inline static lt_t budget_remaining(struct task_struct* t)
 		return 0;
 }
 
+#define get_zerolaxity(t)   (tsk_rt(t)->job_params.zero_laxity)
+#define set_zerolaxity(t) (tsk_rt(t)->job_params.zero_laxity=1)
+#define clear_zerolaxity(t) (tsk_rt(t)->job_params.zero_laxity=0)
+
+inline static lt_t laxity_remaining(struct task_struct* t)
+{
+    lt_t now = litmus_clock();
+	lt_t remaining = budget_remaining(t);
+	lt_t deadline = get_deadline(t);
+
+	if (lt_before(now + remaining, deadline))
+		return (deadline - (now + remaining));
+	else
+		return 0;
+}
+
 #define budget_enforced(t) (tsk_rt(t)->task_params.budget_policy != NO_ENFORCEMENT)
 
 #define budget_precisely_enforced(t) (tsk_rt(t)->task_params.budget_policy \

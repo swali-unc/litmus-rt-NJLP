@@ -62,7 +62,6 @@ int litmus_be_migrate_to(int cpu);
 #define get_boost_start(t)      0
 #endif
 
-
 /* task_params macros */
 #define get_exec_cost(t)  	(tsk_rt(t)->task_params.exec_cost)
 #define get_rt_period(t)	(tsk_rt(t)->task_params.period)
