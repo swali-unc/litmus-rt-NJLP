@@ -268,6 +268,7 @@ static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 	unsigned long flags;
 	struct task_struct* t;
 
+	TS_SCHED_TIMER_START
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
 
 	t = container_of(container_of(timer, struct rt_param, zl_timer),
@@ -278,6 +279,7 @@ static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 	update_queue_position(t);
 
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
+	TS_SCHED_TIMER_END
 
 	return HRTIMER_NORESTART;
 }
@@ -869,6 +871,8 @@ int gsnedf_fmlp_lock(struct litmus_lock* l)
 	if (tsk_rt(t)->num_locks_held)
 		return -EBUSY;
 
+	TS_LOCK_START
+
 	spin_lock_irqsave(&sem->wait.lock, flags);
 
 	if (sem->owner) {
@@ -890,6 +894,7 @@ int gsnedf_fmlp_lock(struct litmus_lock* l)
 				set_priority_inheritance(sem->owner, sem->hp_waiter);
 		}
 
+		TS_LOCK_END;
 		TS_LOCK_SUSPEND;
 
 		/* release lock before sleeping */
@@ -911,6 +916,7 @@ int gsnedf_fmlp_lock(struct litmus_lock* l)
 	} else {
 		/* it's ours now */
 		sem->owner = t;
+		TS_LOCK_END
 
 		spin_unlock_irqrestore(&sem->wait.lock, flags);
 	}
@@ -927,6 +933,7 @@ int gsnedf_fmlp_unlock(struct litmus_lock* l)
 	unsigned long flags;
 	int err = 0;
 
+	TS_UNLOCK_START
 	spin_lock_irqsave(&sem->wait.lock, flags);
 
 	if (sem->owner != t) {
@@ -978,6 +985,7 @@ int gsnedf_fmlp_unlock(struct litmus_lock* l)
 
 out:
 	spin_unlock_irqrestore(&sem->wait.lock, flags);
+	TS_UNLOCK_END
 
 	return err;
 }

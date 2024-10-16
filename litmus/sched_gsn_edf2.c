@@ -121,6 +121,7 @@ struct njlp_semaphore {
 	struct bheap waitq;
 	struct bheap waitq2;
 	spinlock_t waitlock;
+	spinlock_t qlock;
 };
 
 static inline struct njlp_semaphore* njlp_from_lock(struct litmus_lock* lock)
@@ -223,27 +224,29 @@ static void try_update_pi_blocking(struct task_struct* t, int update_last)
 {
 	lt_t now;
 	struct njlp_semaphore* sem;
+	unsigned long flags;
 
 	if (!t || !is_waitqueued(t))
 		return;
 
-	BUG_ON(!tsk_rt(t)->last_updated);
-
-	/* Update pi-blocking */
-	now = litmus_clock();
-	tsk_rt(t)->pi_blocked += now - tsk_rt(t)->last_updated;
-	if (update_last)
-		tsk_rt(t)->last_updated = now;
-	else
-		tsk_rt(t)->last_updated = 0;
-
 	sem = njlp_from_lock(tsk_rt(t)->sem);
 
-	/* Re-order waitq heap due to pi-blocking change */
-	bheap_delete(njlp_priority_order, &sem->waitq, 
-			tsk_rt(t)->waitq_heap_node);
-	bheap_insert(njlp_priority_order, &sem->waitq,
-			tsk_rt(t)->waitq_heap_node);
+	spin_lock(&sem->qlock);
+	if (is_waitqueued(t)) {
+		BUG_ON(!tsk_rt(t)->last_updated);
+
+		/* Update pi-blocking */
+		now = litmus_clock();
+		tsk_rt(t)->pi_blocked += now - tsk_rt(t)->last_updated;
+		if (update_last)
+			tsk_rt(t)->last_updated = now;
+		else
+			tsk_rt(t)->last_updated = 0;
+
+		/* Re-order waitq heap due to pi-blocking change */
+		bheap_decrease(njlp_priority_order, tsk_rt(t)->waitq_heap_node);
+	}
+	spin_unlock(&sem->qlock);
 }
 
 /* link_task_to_cpu - Update the link of a CPU.
@@ -383,6 +386,7 @@ static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 	unsigned long flags;
 	struct task_struct* t;
 
+	TS_SCHED_TIMER_START
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
 
 	t = container_of(container_of(timer, struct rt_param, zl_timer),
@@ -394,6 +398,7 @@ static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 	update_queue_position2(t);
 
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
+	TS_SCHED_TIMER_END
 
 	return HRTIMER_NORESTART;
 }
@@ -442,11 +447,14 @@ static void update_queue_position(struct task_struct *t)
 		BUG_ON(!sem);
 
 		spin_lock(&sem->waitlock);
-		bheap_decrease(edzl_ready_order, tsk_rt(t)->waitq_heap_node2);
+		if (is_waitqueued(t)) {
+			BUG_ON(!bheap_node_in_heap(tsk_rt(t)->waitq_heap_node2));
+			bheap_decrease(edzl_ready_order, tsk_rt(t)->waitq_heap_node2);
 
-		sem->hp_waiter = find_hp_waiter(sem);
-		if (sem->hp_waiter == t)
-			tsk_rt(sem->owner)->inh_task = t;
+			sem->hp_waiter = find_hp_waiter(sem);
+			if (sem->hp_waiter == t)
+				tsk_rt(sem->owner)->inh_task = t;
+		}
 		spin_unlock(&sem->waitlock);
 	}
 
@@ -530,7 +538,8 @@ static noinline void requeue2(struct task_struct* task)
 	if (is_early_releasing(task) || is_released(task, litmus_clock())) {
 		/* sanity check before insertion */
 		BUG_ON(is_queued2(task));
-		__add_pending(&gsnedf, task);
+		if (!is_queued2(task))
+			__add_pending(&gsnedf, task);
 	}
 	// requeue should take care of adding things to the release Q for us
 }
@@ -1077,27 +1086,36 @@ static void clear_priority_inheritance(struct task_struct* t)
 
 /* ******************** FMLP support ********************** */
 
-/* caller is responsible for locking */
 static inline void add_waitqueue(struct njlp_semaphore *sem, struct task_struct* new)
 {
+	spin_lock(&sem->qlock);
+
 	BUG_ON(bheap_node_in_heap(tsk_rt(new)->waitq_heap_node));
+	BUG_ON(tsk_rt(new)->sem != &sem->litmus_lock);
 
 	bheap_insert(njlp_priority_order, &sem->waitq, tsk_rt(new)->waitq_heap_node);
 	bheap_insert(edzl_ready_order, &sem->waitq2, tsk_rt(new)->waitq_heap_node2);
+
+	spin_unlock(&sem->qlock);
 }
 
-/* caller is responsible for locking */
 static inline struct task_struct* take_waitqueue(struct njlp_semaphore *sem)
 {
-	struct task_struct* t;
+	struct task_struct* t = NULL;
+	struct bheap_node* hn;
 
-	struct bheap_node* hn = bheap_take(njlp_priority_order, &sem->waitq);
+	spin_lock(&sem->qlock);
+
+	hn = bheap_take(njlp_priority_order, &sem->waitq);
 	if (hn) {
 		t = bheap2task(hn);
+		BUG_ON(is_waitqueued(t));
 		bheap_delete(edzl_ready_order, &sem->waitq2, tsk_rt(t)->waitq_heap_node2);
-		return t;
-	} else
-		return NULL;
+	}
+
+	spin_unlock(&sem->qlock);
+
+	return t;
 }
 
 /* caller is responsible for locking */
@@ -1123,6 +1141,8 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 	if (tsk_rt(t)->num_locks_held)
 		return -EBUSY;
 
+	TS_LOCK_START
+
 	spin_lock_irqsave(&sem->waitlock, flags);
 
 	if (sem->owner) {
@@ -1144,6 +1164,7 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 				set_priority_inheritance(sem->owner, sem->hp_waiter);
 		}
 
+		TS_LOCK_END
 		TS_LOCK_SUSPEND;
 
 		/* release lock before sleeping */
@@ -1165,6 +1186,7 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 	} else {
 		/* it's ours now */
 		sem->owner = t;
+		TS_LOCK_END
 
 		spin_unlock_irqrestore(&sem->waitlock, flags);
 	}
@@ -1184,6 +1206,8 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 	int cpu;
 	cpu_entry_t *entry;
 
+	TS_UNLOCK_START
+
 	spin_lock_irqsave(&sem->waitlock, flags);
 
 	if (sem->owner != t) {
@@ -1196,10 +1220,12 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 	/* only do pi-blocking updates if there are suspended jobs */
 	if (bheap_peek(njlp_priority_order, &sem->waitq)) {
 		/* loop through top m prio pending jobs and update pi-blocking*/
+		raw_spin_lock(&gsnedf_lock);
 		for_each_online_cpu(cpu) {
 			entry = &per_cpu(gsnedf2_cpu_entries, cpu);
 			try_update_pi_blocking(entry->tracked, 1);
 		}
+		raw_spin_unlock(&gsnedf_lock);
 	}
 
 	/* check if there are jobs waiting for this resource */
@@ -1246,6 +1272,7 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 
 out:
 	spin_unlock_irqrestore(&sem->waitlock, flags);
+	TS_UNLOCK_END
 
 	return err;
 }
@@ -1295,6 +1322,7 @@ static struct litmus_lock* gsnedf_new_njlp(void)
 	bheap_init(&sem->waitq);
 	bheap_init(&sem->waitq2);
 	spin_lock_init(&sem->waitlock);
+	spin_lock_init(&sem->qlock);
 	sem->litmus_lock.ops = &gsnedf_njlp_lock_ops;
 
 	return &sem->litmus_lock;
