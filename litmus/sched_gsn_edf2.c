@@ -446,7 +446,7 @@ static void update_queue_position(struct task_struct *t)
 		sem = njlp_from_lock(tsk_rt(t)->sem);
 		BUG_ON(!sem);
 
-		spin_lock(&sem->waitlock);
+		spin_lock(&sem->qlock);
 		if (is_waitqueued(t)) {
 			BUG_ON(!bheap_node_in_heap(tsk_rt(t)->waitq_heap_node2));
 			bheap_decrease(edzl_ready_order, tsk_rt(t)->waitq_heap_node2);
@@ -455,7 +455,7 @@ static void update_queue_position(struct task_struct *t)
 			if (sem->hp_waiter == t)
 				tsk_rt(sem->owner)->inh_task = t;
 		}
-		spin_unlock(&sem->waitlock);
+		spin_unlock(&sem->qlock);
 	}
 
 	if (tsk_rt(t)->linked_on != NO_CPU) {
