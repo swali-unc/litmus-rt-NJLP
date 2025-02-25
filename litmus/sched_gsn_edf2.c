@@ -1,11 +1,41 @@
 /*
- * litmus/sched_gsn_edf.c
+ * litmus/sched_gsn_edf2.c
  *
- * Implementation of the GSN-EDF scheduling algorithm.
+ * This is the Earliest Deadline Zero Laxity (EDZL) scheduler implementation.
+ * It is implemented as a modification of GSN_EDF.
+ * @author Zelin Tong ztong@cs.unc.edu
  *
- * This version uses the simple approach and serializes all scheduling
- * decisions by the use of a queue lock. This is probably not the
- * best way to do it, but it should suffice for now.
+ * The idea of EDZL is simple, everything works according to global earliest
+ * deadline first with one exception. First, we define laxity as the remaining
+ * time before the deadline, minus the remaining worst-case execution time of the task.
+ * Should the task hit zero laxity, the task's priority is boosted.
+ *
+ * As such, EDZL is not a job-level fixed-priority scheduler. Because EDZL also
+ * has benefits over regular GSN_EDF, we test the NJLP and FMLP on the EDZL scheduler.
+ * 
+ * The NJLP is a locking protocol that prioritizes tasks that have experienced
+ * the most pi-blocking. It has a blocking bound proportional to m, the number
+ * of processors, and as such, it is the first asymptotically optimal non-JLFP
+ * locking protocol.
+ *
+ * To facilitate prioritizing jobs by pi-blocking, we require each task to know
+ * how much pi-blocking it has experienced. This results in a two-fold question,
+ * how does one determine the top m jobs in a system when such a thing is not normally
+ * tracked (because wait-queue'd jobs are not normally present in the ready and cpu queue)?
+ * The second question is how much overhead is involved in keeping track of pi-blocking
+ * anyway?
+ *
+ * The first answer results in doubled scheduling logic as we now need to keep track
+ * of ALL jobs in the system in a single queue. The second answer requires additional
+ * tracking of jobs when they are scheduled, locking, unlocking, and completing.
+ *
+ * When looking at the doubled scheduling logic, it is important to note the
+ * difference between tracked and linked. Something that is linked is affecting the
+ * actual CPU queues. Data structures and functions referencing "tracked" are related
+ * to just tracking a job rather than actually scheduling it.
+ *
+ * Please see the paper for more information on the theory behind the NJLP. This file
+ * contains an example implementation.
  */
 
 #include <linux/spinlock.h>
@@ -118,12 +148,13 @@ struct njlp_semaphore {
 	struct task_struct *hp_waiter;
 
 	/* priority queue of waiting tasks */
-	struct bheap waitq;
-	struct bheap waitq2;
-	spinlock_t waitlock;
-	spinlock_t qlock;
+	struct bheap waitq; // njlp_priority_order
+	struct bheap waitq2; // edzl_ready_order
+	spinlock_t waitlock; // The waitlock is used to work on locking data structures
+	spinlock_t qlock;  // The qlock specifically locks down wait queues which affect inheritance
 };
 
+// Obtains the njlp_semaphore when only passed the litmus_lock member
 static inline struct njlp_semaphore* njlp_from_lock(struct litmus_lock* lock)
 {
 	return container_of(lock, struct njlp_semaphore, litmus_lock);
@@ -135,20 +166,31 @@ typedef struct  {
 	int 			cpu;
 	struct task_struct*	linked;		/* only RT tasks */
 	struct task_struct*	scheduled;	/* only RT tasks */
+
+	// tracked lets us track the top m jobs in the system.
+	// If a job is tracked, then it is in the top m, but that
+	// doesn't mean it is necessarily scheduled.
 	struct task_struct* tracked;
+
+	// The heap nodes below are according to priority order and base priority order
+	// respectively. The base priority order is important for NJLP because inherited
+	// priorities are not helpful when determining pi-blocking time.
 	struct bheap_node*	hn;
 	struct bheap_node* hn2;
 } cpu_entry_t;
 DEFINE_PER_CPU(cpu_entry_t, gsnedf2_cpu_entries);
 
+// The cpu entries. NR_CPUs is the number of threads on the system
 cpu_entry_t* gsnedf2_cpus[NR_CPUS];
 
 /* the cpus queue themselves according to priority in here */
+// Note, specific to the NJLP, note there is doubled scheduling logic.
 static struct bheap_node gsnedf_heap_node[NR_CPUS];
 static struct bheap_node gsnedf_heap_node2[NR_CPUS];
 static struct bheap      gsnedf_cpu_heap;
 static struct bheap      gsnedf_cpu_heap2;
 
+// The rt_domain contains everything related to this implementation of EDZL
 static rt_domain_t gsnedf;
 #define gsnedf_lock (gsnedf.ready_lock)
 
@@ -158,6 +200,8 @@ static rt_domain_t gsnedf;
 #define WANT_ALL_SCHED_EVENTS
  */
 
+// This function compares two cpu bheap nodes to determine which
+// cpu job has a lower priority according to EDZL
 static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
 {
 	cpu_entry_t *a, *b;
@@ -169,6 +213,8 @@ static int cpu_lower_prio(struct bheap_node *_a, struct bheap_node *_b)
 	return edzl_higher_prio(b->linked, a->linked);
 }
 
+// Similar to the previous function, but with base priorities instead.
+// Inherited priorities are not helpful when determining pi-blocking
 static int cpu_lower_base_prio(struct bheap_node *_a, struct bheap_node *_b)
 {
 	cpu_entry_t *a, *b;
@@ -190,6 +236,8 @@ static void update_cpu_position(cpu_entry_t *entry)
 	bheap_insert(cpu_lower_prio, &gsnedf_cpu_heap, entry->hn);
 }
 
+// NJLP-specific version of the previous method where we are operating
+// using the secondary data structures.
 static void update_cpu_position2(cpu_entry_t *entry)
 {
 	if (likely(bheap_node_in_heap(entry->hn2)))
@@ -198,6 +246,9 @@ static void update_cpu_position2(cpu_entry_t *entry)
 }
 
 /* caller must hold gsnedf lock */
+// If there is going to be a job on the cpu that will be preempted,
+// it will be the lowest priority one first, so this function will help
+// find that.
 static cpu_entry_t* lowest_prio_cpu(void)
 {
 	struct bheap_node* hn;
@@ -205,6 +256,8 @@ static cpu_entry_t* lowest_prio_cpu(void)
 	return hn->value;
 }
 
+// The NJLP version of the previous method where we use the secondary
+// data structures.
 static cpu_entry_t* lowest_base_prio_cpu(void)
 {
 	struct bheap_node* hn;
@@ -212,6 +265,7 @@ static cpu_entry_t* lowest_base_prio_cpu(void)
 	return hn->value;
 }
 
+// The NJLP's priority order is determined by whichever task has pi-blocked longer.
 static int njlp_priority_order(struct bheap_node* a, struct bheap_node* b)
 {
 	struct task_struct* ta = bheap2task(a);
@@ -220,12 +274,17 @@ static int njlp_priority_order(struct bheap_node* a, struct bheap_node* b)
 	return (tsk_rt(ta)->pi_blocked > tsk_rt(tb)->pi_blocked);
 }
 
+// This will update the pi-blocking of a task but also perform some extra
+// checks.
 static void try_update_pi_blocking(struct task_struct* t, int update_last)
 {
 	lt_t now;
 	struct njlp_semaphore* sem;
 	unsigned long flags;
 
+	//  A sanity check to make sure the task is actually wait queue'd and
+	// the task isn't NULL (if a core became idle, the next task is NULL,
+	// so make sure that isn't passed here)
 	if (!t || !is_waitqueued(t))
 		return;
 
@@ -260,6 +319,7 @@ static noinline void link_task_to_cpu(struct task_struct* linked,
 	struct task_struct* tmp;
 	int on_cpu;
 
+	// Only want to deal with real-time tasks
 	BUG_ON(linked && !is_realtime(linked));
 
 	/* Currently linked task is set to be unlinked. */
@@ -305,6 +365,9 @@ static noinline void link_task_to_cpu(struct task_struct* linked,
 	update_cpu_position(entry);
 }
 
+// This is the NJLP version of the previous function.
+// Recall, tracked to a cpu does not mean you are actually scheduled on it.
+// Instead, if you are tracked on a cpu, then you are in the top m priorities.
 static noinline void track_task_to_cpu(struct task_struct* tracked,
 				      cpu_entry_t *entry)
 {
@@ -318,7 +381,7 @@ static noinline void track_task_to_cpu(struct task_struct* tracked,
 		try_update_pi_blocking(entry->tracked, 0);
 	}
 
-	/* Link new task to CPU. */
+	/* Track new task to CPU. */
 	if (tracked) {
 		tracked->rt_param.tracked_on = entry->cpu;
 
@@ -362,6 +425,8 @@ static noinline void unlink(struct task_struct* t)
 	}
 }
 
+// Similar to unlinking, untracking will remove a task from
+// the cpu in terms of tracking the top m.
 static noinline void untrack(struct task_struct* t)
 {
 	cpu_entry_t *entry;
@@ -381,6 +446,8 @@ static noinline void untrack(struct task_struct* t)
 static void update_queue_position(struct task_struct *t);
 static void update_queue_position2(struct task_struct *t);
 
+// This is the hrtimer callback that will run when a task
+// reaches zero laxity. This function will boost the task's priority.
 static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 {
 	unsigned long flags;
@@ -389,10 +456,13 @@ static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 	TS_SCHED_TIMER_START
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
 
+	// Grab the task of this timer
 	t = container_of(container_of(timer, struct rt_param, zl_timer),
 			struct task_struct,
 			rt_param);
 
+	// Set the laxity flag, and update queue positions. We update
+	// all queues because this will very likely affect actual scheduling.
 	set_zerolaxity(t);
 	update_queue_position(t);
 	update_queue_position2(t);
@@ -403,6 +473,9 @@ static enum hrtimer_restart on_zero_laxity(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+// For EDZL, if we are taking a ready job, make sure to cancel
+// the zero laxity timer associated with it. Other than that, this is
+// just the take ready function which will retrieve a ready task.
 static inline struct task_struct* __edzl_take_ready(rt_domain_t* rt)
 {
 	struct task_struct* t = __take_ready(rt);
@@ -417,6 +490,8 @@ static inline struct task_struct* __edzl_take_ready(rt_domain_t* rt)
 	return t;
 }
 
+// Adds a ready task to this scheduler. This function will also set up
+// an hr timer to ensure the zero_laxity event can be captured.
 static inline void __edzl_add_ready(rt_domain_t* rt, struct task_struct *new)
 {
 	__add_ready(rt, new);
@@ -436,6 +511,9 @@ static inline void __edzl_add_ready(rt_domain_t* rt, struct task_struct *new)
 static void check_for_preemptions(void);
 static struct task_struct* find_hp_waiter(struct njlp_semaphore *sem);
 
+// Updating a task's queue position will likely happen when there
+// is a priority change. The overview of this function is to check
+// and update all appropriate queues related to scheduling appropriately.
 static void update_queue_position(struct task_struct *t)
 {
 	int check_preempt = 0;
@@ -443,14 +521,21 @@ static void update_queue_position(struct task_struct *t)
 	unsigned long flags;
 
 	if (is_waitqueued(t)) {
+		// If we are wait queued, make sure we update our
+		// position in this wait queue
+
+		// Grab the associated lock
 		sem = njlp_from_lock(tsk_rt(t)->sem);
 		BUG_ON(!sem);
 
 		spin_lock(&sem->qlock);
 		if (is_waitqueued(t)) {
 			BUG_ON(!bheap_node_in_heap(tsk_rt(t)->waitq_heap_node2));
+
+			// Update our position in the wait queue
 			bheap_decrease(edzl_ready_order, tsk_rt(t)->waitq_heap_node2);
 
+			// Is priority inheritance needed?
 			sem->hp_waiter = find_hp_waiter(sem);
 			if (sem->hp_waiter == t)
 				tsk_rt(sem->owner)->inh_task = t;
@@ -458,19 +543,25 @@ static void update_queue_position(struct task_struct *t)
 		spin_unlock(&sem->qlock);
 	}
 
+	// Is this task on the CPU?
 	if (tsk_rt(t)->linked_on != NO_CPU) {
+		// Re-enqueue it to update the queue position
 		bheap_delete(cpu_lower_prio, &gsnedf_cpu_heap,
 				gsnedf2_cpus[tsk_rt(t)->linked_on]->hn);
 		bheap_insert(cpu_lower_prio, &gsnedf_cpu_heap,
 				gsnedf2_cpus[tsk_rt(t)->linked_on]->hn);
 	} else {
+		// If we aren't on the CPU, then..
 		raw_spin_lock(&gsnedf.release_lock);
 		if (is_queued(t)) {
+			// Update our ready queue position
 			check_preempt = !bheap_decrease(edzl_ready_order,
 					tsk_rt(t)->heap_node);
 		}
 		raw_spin_unlock(&gsnedf.release_lock);
 
+		// If we're at the top of the ready queue, then
+		// we should check for preemption opportunities
 		if (check_preempt) {
 			bheap_uncache_min(edzl_ready_order,
 					&gsnedf.ready_queue);
@@ -481,23 +572,33 @@ static void update_queue_position(struct task_struct *t)
 
 static void check_for_prio_changes(void);
 
+// This is similar to the update_queue_position function but less
+// needs to be done here because we don't need to actually schedule
+// on the cpu, but only where tasks are tracked
 static void update_queue_position2(struct task_struct *t)
 {
 	int check_preempt = 0;
 
 	if (tsk_rt(t)->tracked_on != NO_CPU) {
+		// If we are tracked on a CPU, then update that as
+		// our position may have changed
 		bheap_delete(cpu_lower_base_prio, &gsnedf_cpu_heap,
 				gsnedf2_cpus[tsk_rt(t)->tracked_on]->hn);
 		bheap_insert(cpu_lower_base_prio, &gsnedf_cpu_heap,
 				gsnedf2_cpus[tsk_rt(t)->tracked_on]->hn);
 	} else {
+		// If we aren't tracked on the CPU..
 		raw_spin_lock(&gsnedf.release_lock);
 		if (is_queued2(t)) {
+			// Update our position in the secondary ready queue
 			check_preempt = !bheap_decrease(edzl_pending_order,
 					tsk_rt(t)->heap_node);
 		}
 		raw_spin_unlock(&gsnedf.release_lock);
 
+		// If we hit the top of the ready queue, then it is likely
+		// that we need to check for priority changes where this task
+		// might need to be tracked on a CPU instead
 		if (check_preempt) {
 			bheap_uncache_min(edzl_pending_order,
 					&gsnedf.pending_queue);
@@ -531,6 +632,8 @@ static noinline void requeue(struct task_struct* task)
 	}
 }
 
+// This function is similar to requeue except operating on the
+// secondary data structures.
 static noinline void requeue2(struct task_struct* task)
 {
 	BUG_ON(!task);
@@ -544,6 +647,7 @@ static noinline void requeue2(struct task_struct* task)
 	// requeue should take care of adding things to the release Q for us
 }
 
+// The EDZL-NJLP does not incorporate affinity masks
 #ifdef CONFIG_SCHED_CPU_AFFINITY
 static cpu_entry_t* gsnedf_get_nearest_available_cpu(cpu_entry_t *start)
 {
@@ -581,6 +685,7 @@ static void check_for_preemptions(void)
 	    && likely(local->cpu != gsnedf.release_master)
 #endif
 		) {
+		// Local cpu is idle, so link to the local CPU
 		task = __edzl_take_ready(&gsnedf);
 		TRACE_TASK(task, "linking to local CPU %d to avoid IPI\n", local->cpu);
 		link_task_to_cpu(task, local);
@@ -588,6 +693,9 @@ static void check_for_preemptions(void)
 	}
 #endif
 
+	// This for loop is simple, find the lowest priority job on the CPU
+	// and check to see if it is a lower priority than the highest priority
+	// job that is ready. If so, preempt, swap the two tasks, then repeat.
 	for (last = lowest_prio_cpu();
 	     edzl_preemption_needed(&gsnedf, last->linked);
 	     last = lowest_prio_cpu()) {
@@ -607,15 +715,20 @@ static void check_for_preemptions(void)
 				requeue(last->linked);
 		}
 #else
+		// We need to requeue the job that was preempted
 		if (requeue_preempted_job(last->linked))
 			requeue(last->linked);
 #endif
 
+		// Add the new task to the cpu
 		link_task_to_cpu(task, last);
 		preempt(last);
 	}
 }
 
+// This is similar to the function above, but for the NJLP's doubled
+// scheduling logic. It may look smaller, but that is because we do not
+// incorporate affinity masks in this work.
 static void check_for_prio_changes(void)
 {
 	struct task_struct *task;
@@ -635,12 +748,16 @@ static void check_for_prio_changes(void)
 	    && likely(local->cpu != gsnedf.release_master)
 #endif
 		) {
+		// Local CPU is idle, so link to the local CPU
 		task = __take_pending(&gsnedf);
 		TRACE_TASK(task, "tracking to local CPU %d to mimic local linking\n", local->cpu);
 		track_task_to_cpu(task, local);
 	}
 #endif
 
+	// This for loop is simple, find the lowest priority job on the CPU
+	// and check to see if it is a lower priority than the highest priority
+	// job that is ready. If so, preempt, swap the two tasks, then repeat.
 	for (last = lowest_base_prio_cpu();
 	     edzl_preemption_needed2(&gsnedf, last->tracked);
 	     last = lowest_base_prio_cpu()) {
@@ -661,12 +778,15 @@ static noinline void gsnedf_job_arrival(struct task_struct* task)
 {
 	BUG_ON(!task);
 
+	// Update laxity.
 	if (laxity_remaining(task))
 		clear_zerolaxity(task);
 	else
 		set_zerolaxity(task);
 
+	// will enqueue the task so that we can schedule it
 	requeue(task);
+	// Possible that this task will need to be scheduled immediately
 	check_for_preemptions();
 }
 
@@ -675,22 +795,28 @@ static noinline void gsnedf_prio_change(struct task_struct* task)
 {
 	BUG_ON(!task);
 
+	// All we need to do is requeue the task with the priority change
 	requeue2(task);
+	// possible we will need to track on to a CPU if we're in the top m
 	check_for_prio_changes();
 }
 
+// This will merge the tasks into the ready queue
 static void gsnedf_release_jobs(rt_domain_t* rt, struct bheap* tasks)
 {
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
 
+	// Merge incoming tasks into the ready queue
 	__merge_ready(rt, tasks);
+	// Possible some of these tasks may need to be linked to a CPU
 	check_for_preemptions();
 
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
 }
 
+// doubled scheduling logic version of the above function.
 static void gsnedf_release_jobs2(rt_domain_t* rt, struct bheap* tasks)
 {
 	unsigned long flags;
@@ -698,6 +824,8 @@ static void gsnedf_release_jobs2(rt_domain_t* rt, struct bheap* tasks)
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
 
 	__merge_pending(rt, tasks);
+	// It is possible that some of these  tasks may be in the top
+	// m priorities, so check for prio change to track them.
 	check_for_prio_changes();
 
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
@@ -709,6 +837,7 @@ static noinline void curr_job_completion(int forced)
 	struct task_struct *t = current;
 	BUG_ON(!t);
 
+	// This is just additional trace outputs
 	sched_trace_task_completion(t, forced);
 
 	TRACE_TASK(t, "job_completion(forced=%d).\n", forced);
@@ -750,6 +879,9 @@ static noinline void curr_job_completion(int forced)
  *					   sys_exit_np must be requested
  *
  * Any of these can occur together.
+ *
+ * We need to return the task that we do want scheduled though, and NULL if
+ * we're okay with being idle.
  */
 static struct task_struct* gsnedf_schedule(struct task_struct * prev)
 {
@@ -894,6 +1026,7 @@ static void gsnedf_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 
 	raw_spin_lock_irqsave(&gsnedf_lock, flags);
 
+	// This hrtimer will help find our zero laxity point if we get boosted.
 	hrtimer_init(&t->rt_param.zl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	tsk_rt(t)->zl_timer.function = on_zero_laxity;
 
@@ -907,6 +1040,7 @@ static void gsnedf_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 #ifdef CONFIG_RELEASE_MASTER
 		if (entry->cpu != gsnedf.release_master) {
 #endif
+			// This cpu schedules t
 			entry->scheduled = t;
 			tsk_rt(t)->scheduled_on = task_cpu(t);
 #ifdef CONFIG_RELEASE_MASTER
@@ -919,16 +1053,22 @@ static void gsnedf_task_new(struct task_struct * t, int on_rq, int is_scheduled)
 	} else {
 		t->rt_param.scheduled_on = NO_CPU;
 	}
+
+	// New task isn't linked/tracked (yet)
 	t->rt_param.linked_on          = NO_CPU;
 	t->rt_param.tracked_on		   = NO_CPU;
 
 	if (on_rq || is_scheduled) {
+		// If we're ready or scheduled, then make sure this
+		// new task arrival is properly linked and tracked
+		// according to its priority
 		gsnedf_job_arrival(t);
 		gsnedf_prio_change(t);
 	}
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
 }
 
+// When a task wakes up
 static void gsnedf_task_wake_up(struct task_struct *task)
 {
 	unsigned long flags;
@@ -945,6 +1085,7 @@ static void gsnedf_task_wake_up(struct task_struct *task)
 	raw_spin_unlock_irqrestore(&gsnedf_lock, flags);
 }
 
+// When a task blocks, we unlink it so it isn't on a cpu
 static void gsnedf_task_block(struct task_struct *t)
 {
 	unsigned long flags;
@@ -959,7 +1100,7 @@ static void gsnedf_task_block(struct task_struct *t)
 	BUG_ON(!is_realtime(t));
 }
 
-
+// Remove the task from the romain
 static void gsnedf_task_exit(struct task_struct * t)
 {
 	unsigned long flags;
@@ -969,14 +1110,17 @@ static void gsnedf_task_exit(struct task_struct * t)
 	unlink(t);
 	untrack(t);
 	if (tsk_rt(t)->scheduled_on != NO_CPU) {
+		// Remove ourselves from the CPU
 		gsnedf2_cpus[tsk_rt(t)->scheduled_on]->scheduled = NULL;
 		tsk_rt(t)->scheduled_on = NO_CPU;
 	}
 	if (tsk_rt(t)->tracked_on != NO_CPU) {
+		// Remove ourselves from the top m priorities
 		gsnedf2_cpus[tsk_rt(t)->tracked_on]->tracked = NULL;
 		tsk_rt(t)->tracked_on = NO_CPU;
 	}
 
+	// cancel the zero laxity timer
 	if (hrtimer_active(&tsk_rt(t)->zl_timer)) {
 		hrtimer_cancel(&tsk_rt(t)->zl_timer);
 	}
@@ -986,7 +1130,7 @@ static void gsnedf_task_exit(struct task_struct * t)
         TRACE_TASK(t, "RIP\n");
 }
 
-
+// Just admit all of them
 static long gsnedf_admit_task(struct task_struct* tsk)
 {
 	return 0;
@@ -997,6 +1141,12 @@ static long gsnedf_admit_task(struct task_struct* tsk)
 #include <litmus/fdso.h>
 
 /* called with IRQs off */
+// Priority inheritance is used to ensure the system doesn't stall. If a higher-priority job
+// is waiting on a resource held by a lower priority job, the lower priority job inherits the
+// higher priority so that the higher priority job isn't waiting on a job that doesn't have
+// sufficient priority. Of course, the higher priority might also not be sufficient priority
+// to be scheduled, but that blocking time is attributed to higher-priority work rather than
+// the priority inversion blocking time.
 static void set_priority_inheritance(struct task_struct* t, struct task_struct* prio_inh)
 {
 	int linked_on;
@@ -1007,6 +1157,7 @@ static void set_priority_inheritance(struct task_struct* t, struct task_struct* 
 	TRACE_TASK(t, "inherits priority from %s/%d\n", prio_inh->comm, prio_inh->pid);
 	tsk_rt(t)->inh_task = prio_inh;
 
+	// which cpu are we linked on?
 	linked_on  = tsk_rt(t)->linked_on;
 
 	/* If it is scheduled, then we need to reorder the CPU heap. */
@@ -1084,7 +1235,7 @@ static void clear_priority_inheritance(struct task_struct* t)
 }
 
 
-/* ******************** FMLP support ********************** */
+/* ******************** FMLP/NJLP support ********************** */
 
 static inline void add_waitqueue(struct njlp_semaphore *sem, struct task_struct* new)
 {
@@ -1093,12 +1244,15 @@ static inline void add_waitqueue(struct njlp_semaphore *sem, struct task_struct*
 	BUG_ON(bheap_node_in_heap(tsk_rt(new)->waitq_heap_node));
 	BUG_ON(tsk_rt(new)->sem != &sem->litmus_lock);
 
+	// Doubled scheduling logic. NJLP priority order is by piblocking
+	// and EDZL priority order is by EDF and zero laxity.
 	bheap_insert(njlp_priority_order, &sem->waitq, tsk_rt(new)->waitq_heap_node);
 	bheap_insert(edzl_ready_order, &sem->waitq2, tsk_rt(new)->waitq_heap_node2);
 
 	spin_unlock(&sem->qlock);
 }
 
+// Grab the next task that is in this semaphore's wait queue
 static inline struct task_struct* take_waitqueue(struct njlp_semaphore *sem)
 {
 	struct task_struct* t = NULL;
@@ -1108,8 +1262,10 @@ static inline struct task_struct* take_waitqueue(struct njlp_semaphore *sem)
 
 	hn = bheap_take(njlp_priority_order, &sem->waitq);
 	if (hn) {
+		// Get the task
 		t = bheap2task(hn);
 		BUG_ON(is_waitqueued(t));
+		// And remove it from the wait queue
 		bheap_delete(edzl_ready_order, &sem->waitq2, tsk_rt(t)->waitq_heap_node2);
 	}
 
@@ -1128,6 +1284,7 @@ static struct task_struct* find_hp_waiter(struct njlp_semaphore *sem)
 		return NULL;
 }
 
+// This function is called when locking on a lock arbitrated by the NJLP.
 int gsnedf_njlp_lock(struct litmus_lock* l)
 {
 	struct task_struct* t = current;
@@ -1141,6 +1298,7 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 	if (tsk_rt(t)->num_locks_held)
 		return -EBUSY;
 
+	// trace locking overheads
 	TS_LOCK_START
 
 	spin_lock_irqsave(&sem->waitlock, flags);
@@ -1196,6 +1354,7 @@ int gsnedf_njlp_lock(struct litmus_lock* l)
 	return 0;
 }
 
+// This function is called when unlocking with the NJLP
 int gsnedf_njlp_unlock(struct litmus_lock* l)
 {
 	struct task_struct *t = current, *next;
@@ -1206,6 +1365,7 @@ int gsnedf_njlp_unlock(struct litmus_lock* l)
 	int cpu;
 	cpu_entry_t *entry;
 
+	// trace the unlock overheads
 	TS_UNLOCK_START
 
 	spin_lock_irqsave(&sem->waitlock, flags);
@@ -1277,6 +1437,7 @@ out:
 	return err;
 }
 
+// Function will unlock the lock if we are the owner
 int gsnedf_njlp_close(struct litmus_lock* l)
 {
 	struct task_struct *t = current;
@@ -1297,11 +1458,14 @@ int gsnedf_njlp_close(struct litmus_lock* l)
 	return 0;
 }
 
+// Free the lock data structure
 void gsnedf_njlp_free(struct litmus_lock* lock)
 {
 	kfree(njlp_from_lock(lock));
 }
 
+// Litmus requires us to specify how lock operations are done
+// using a struct of function pointers.
 static struct litmus_lock_ops gsnedf_njlp_lock_ops = {
 	.close  = gsnedf_njlp_close,
 	.lock   = gsnedf_njlp_lock,
@@ -1309,6 +1473,7 @@ static struct litmus_lock_ops gsnedf_njlp_lock_ops = {
 	.deallocate = gsnedf_njlp_free,
 };
 
+// Initialize the data structures associated with an NJLP lock
 static struct litmus_lock* gsnedf_new_njlp(void)
 {
 	struct njlp_semaphore* sem;
@@ -1317,6 +1482,7 @@ static struct litmus_lock* gsnedf_new_njlp(void)
 	if (!sem)
 		return NULL;
 
+	// This just initializes the struct
 	sem->owner   = NULL;
 	sem->hp_waiter = NULL;
 	bheap_init(&sem->waitq);
@@ -1329,14 +1495,12 @@ static struct litmus_lock* gsnedf_new_njlp(void)
 }
 
 /* **** lock constructor **** */
-
-
 static long gsnedf_allocate_lock(struct litmus_lock **lock, int type,
 				 void* __user unused)
 {
 	int err = -ENXIO;
 
-	/* GSN-EDF currently only supports the FMLP for global resources. */
+	/* EDZL-NJLP currently only supports the NJLP for global resources. */
 	switch (type) {
 
 	case NJLP_SEM:
@@ -1362,6 +1526,8 @@ static long gsnedf_get_domain_proc_info(struct domain_proc_info **ret)
 	return 0;
 }
 
+// This function initializes everything associated with scheduling on
+// EDZL-NJLP, including cpu queues and initializing the rt_domain.
 static void gsnedf_setup_domain_proc(void)
 {
 	int i, cpu;
@@ -1374,11 +1540,13 @@ static void gsnedf_setup_domain_proc(void)
 	int num_rt_cpus = num_online_cpus() - (release_master != NO_CPU);
 	struct cd_mapping *map;
 
+	// init the domain
 	memset(&gsnedf_domain_proc_info, 0, sizeof(gsnedf_domain_proc_info));
 	init_domain_proc_info(&gsnedf_domain_proc_info, num_rt_cpus, 1);
 	gsnedf_domain_proc_info.num_cpus = num_rt_cpus;
 	gsnedf_domain_proc_info.num_domains = 1;
 
+	// init the CPUs
 	gsnedf_domain_proc_info.domain_to_cpus[0].id = 0;
 	for (cpu = 0, i = 0; cpu < num_online_cpus(); ++cpu) {
 		if (cpu == release_master)
@@ -1394,6 +1562,7 @@ static void gsnedf_setup_domain_proc(void)
 	}
 }
 
+// When the EDZL-NJLP plugin is activated, this gets called
 static long gsnedf_activate_plugin(void)
 {
 	int cpu;
@@ -1405,6 +1574,9 @@ static long gsnedf_activate_plugin(void)
 	gsnedf.release_master = atomic_read(&release_master_cpu);
 #endif
 
+	// Each of the cpus has data structures associated with it.
+	// The loop below simply initializes each cpu's data structures.
+	
 	for_each_online_cpu(cpu) {
 		entry = &per_cpu(gsnedf2_cpu_entries, cpu);
 		bheap_node_init(&entry->hn, entry);
@@ -1437,6 +1609,8 @@ static long gsnedf_deactivate_plugin(void)
 }
 
 /*	Plugin object	*/
+// Litmus requires us to fill out function pointers and information
+// related to our scheduler in the sched_plugin struct.
 static struct sched_plugin gsn_edf_plugin __cacheline_aligned_in_smp = {
 	.plugin_name		= "EDZL-NJLP",
 	.finish_switch		= gsnedf_finish_switch,
@@ -1455,7 +1629,7 @@ static struct sched_plugin gsn_edf_plugin __cacheline_aligned_in_smp = {
 #endif
 };
 
-
+// This will be called when initializing the module, and happens very early
 static int __init init_gsn_edf(void)
 {
 	int cpu;
@@ -1478,5 +1652,5 @@ static int __init init_gsn_edf(void)
 	return register_sched_plugin(&gsn_edf_plugin);
 }
 
-
+// Initialize this module
 module_init(init_gsn_edf);
